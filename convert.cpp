@@ -17,6 +17,7 @@ void align_output(FILE *fout, uint32_t align) {
 int main(int argc, char *argv[]) {
     if (argc < 3) {
         printf("usage: %s in.nro out.nrs\n", argv[0]);
+        printf("or     %s in.nso out.nss\n", argv[0]);
         return 0;
     }
     auto fout = fopen(argv[2], "wb");
@@ -24,8 +25,8 @@ int main(int argc, char *argv[]) {
         perror("fopen output");
         return 1;
     }
-    auto program = NROProgram::load_file(argv[1]);
-    printf("0x%08X program bytes\n", program.header.text.size + program.header.ro.size + program.header.data.size);
+    auto program = NXOProgram::load_file(argv[1]);
+    printf("0x%08X program bytes (%08X + %08X + %08X)\n", program.text_seg.size + program.ro_seg.size + program.data_seg.size, program.text_seg.size, program.ro_seg.size, program.data_seg.size);
     auto dyn = program.dynamic();
     // printf(".dynamic %08X-%08X\n", dyn.addr, dyn.addr + dyn.size);
     auto sections = program.sections();
@@ -58,7 +59,7 @@ int main(int argc, char *argv[]) {
         shstrtab_stridx,
         SHT_STRTAB, 0x00,
         0,
-        data_offset + align_size(program.header.text.size) + align_size(program.header.ro.size) + align_size(program.header.data.size),
+        data_offset + align_size(program.text_seg.size) + align_size(program.ro_seg.size) + align_size(program.data_seg.size),
         shstrtab.size(),
         0,
         0,
@@ -68,34 +69,34 @@ int main(int argc, char *argv[]) {
     NXElfHeader elf_header;
     elf_header.e_shnum = sections.size() + 1;
     elf_header.e_shstridx = sections.size();
-    elf_header.e_shoff = data_offset + align_size(program.header.text.size) + align_size(program.header.ro.size) + align_size(program.header.data.size) + align_size(shstrtab.size());
+    elf_header.e_shoff = data_offset + align_size(program.text_seg.size) + align_size(program.ro_seg.size) + align_size(program.data_seg.size) + align_size(shstrtab.size());
     elf_header.p_text = {
         PT_LOAD, PF_X | PF_R,
-        data_offset + program.offset(program.header.text.addr),
-        program.header.text.addr, program.header.text.addr,
-        program.header.text.size, program.header.text.size,
+        data_offset + program.offset(program.text_seg.addr),
+        program.text_seg.addr, program.text_seg.addr,
+        program.text_seg.size, program.text_seg.size,
         0x1000
     };
     elf_header.p_ro = {
         PT_LOAD, PF_R,
-        data_offset + program.offset(program.header.ro.addr),
-        program.header.ro.addr, program.header.ro.addr,
-        program.header.ro.size, program.header.ro.size,
+        data_offset + program.offset(program.ro_seg.addr),
+        program.ro_seg.addr, program.ro_seg.addr,
+        program.ro_seg.size, program.ro_seg.size,
         0x1000
     };
     elf_header.p_data = {
         PT_LOAD, PF_R | PF_W,
-        data_offset + program.offset(program.header.data.addr),
-        program.header.data.addr, program.header.data.addr,
-        program.header.data.size, program.header.data.size,
+        data_offset + program.offset(program.data_seg.addr),
+        program.data_seg.addr, program.data_seg.addr,
+        program.data_seg.size, program.data_seg.size,
         0x1000
     };
-    auto bss_addr = program.header.data.addr + program.header.data.size;
+    auto bss_addr = program.data_seg.addr + program.data_seg.size;
     elf_header.p_bss = {
         PT_LOAD, PF_R | PF_W,
-        data_offset + program.offset(program.header.data.addr) + program.header.data.size,
+        data_offset + program.offset(program.data_seg.addr) + program.data_seg.size,
         bss_addr, bss_addr,
-        0, program.header.bss_size,
+        0, program.bss_size,
         0x1000
     };
     auto dynsect = program.dynamic_seg();

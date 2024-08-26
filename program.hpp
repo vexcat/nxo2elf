@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <unordered_map>
 #include <unordered_set>
+#include <lz4.h>
 #include "elf.hpp"
 
 static uint32_t align_size(uint32_t size) {
@@ -64,7 +65,7 @@ struct ELFRel {
     uint64_t info;
 };
 
-struct NROSegment {
+struct NXOSegment {
     uint32_t addr;
     uint32_t size;
     bool contains(uint32_t taddr, uint32_t tsize) {
@@ -72,20 +73,54 @@ struct NROSegment {
     }
 };
 
-struct NROHeader {
+struct ModuleHeader {
     uint32_t reserved1;
     uint32_t mod0offset;
     uint32_t nnsdkvers;
     uint32_t reserved2;
+};
+
+struct NROHeader {
+    ModuleHeader mod;
     char magic[4];
     uint32_t version, size, flags;
-    NROSegment text, ro, data;
+    NXOSegment text, ro, data;
     uint32_t bss_size, reserved3;
     char modid[0x20];
     uint32_t dso_offset;
     uint32_t reserved4;
-    NROSegment api_info, dynstr, dynsym;
+    NXOSegment api_info, dynstr, dynsym;
 };
+
+struct NSOSegment {
+    uint32_t offset;
+    uint32_t addr;
+    uint32_t size; // decompressed size
+};
+
+struct NSOHeader {
+    char magic[4];
+    uint32_t version;
+    uint32_t reserved1;
+    uint32_t flags;
+    NSOSegment text;
+    uint32_t modname_offset;
+    NSOSegment ro;
+    uint32_t modname_size;
+    NSOSegment data;
+    uint32_t bss_size;
+    uint8_t modid[0x20];
+    uint32_t text_file_size;
+    uint32_t ro_file_size;
+    uint32_t data_file_size;
+    uint8_t reserved2[0x1C];
+    NXOSegment api_info, dynstr, dynsym;
+    uint8_t text_hash[0x20];
+    uint8_t ro_hash[0x20];
+    uint8_t data_hash[0x20];
+};
+
+static_assert(sizeof(NSOHeader) == 0x100);
 
 struct MODHeader {
     char magic[4];
@@ -104,19 +139,22 @@ struct DynEntry {
     uint64_t value;
 };
 
-struct NROProgram {
-    NROHeader header;
+struct NXOProgram {
+    NXOSegment text_seg, ro_seg, data_seg;
+    uint32_t bss_size;
+    NXOSegment api_info, dynstr, dynsym;
     std::vector<uint8_t> text, ro, data;
+    bool is_nro = true;
     uint8_t *resolve(uint32_t addr, uint32_t size = 0) {
-        if (header.text.contains(addr, size)) return text.data() + addr - header.text.addr;
-        if (header.ro  .contains(addr, size)) return ro  .data() + addr - header.ro  .addr;
-        if (header.data.contains(addr, size)) return data.data() + addr - header.data.addr;
+        if (text_seg.contains(addr, size)) return text.data() + addr - text_seg.addr;
+        if (ro_seg  .contains(addr, size)) return ro  .data() + addr - ro_seg  .addr;
+        if (data_seg.contains(addr, size)) return data.data() + addr - data_seg.addr;
         return nullptr;
     }
     uint32_t offset(uint32_t addr) {
-        if (header.text.contains(addr, 0)) return addr - header.text.addr;
-        if (header.ro  .contains(addr, 0)) return align_size(text.size()) + addr - header.ro  .addr;
-        return align_size(text.size()) + align_size(ro.size()) + addr - header.data.addr;
+        if (text_seg.contains(addr, 0)) return addr - text_seg.addr;
+        if (ro_seg  .contains(addr, 0)) return align_size(text.size()) + addr - ro_seg.addr;
+        return align_size(text.size()) + align_size(ro.size()) + addr - data_seg.addr;
     }
     std::vector<uint8_t> read_bytes(uint32_t addr, uint32_t size) {
         auto ptr = resolve(addr, size);
@@ -140,21 +178,109 @@ struct NROProgram {
         }
         return ret;
     }
-    static NROProgram load_file(const char *filename) {
-        NROProgram prg;
+
+    static NXOProgram load_file(const char *filename) {
         FILE *fin = fopen(filename, "rb");
         if (!fin) throw std::runtime_error {"Failed to open file"};
-        if(!fread(&prg.header, sizeof(prg.header), 1, fin)) {
+        char ident[0x14];
+        if (!fread(ident, sizeof(ident), 1, fin)) {
+            fclose(fin);
+            throw std::runtime_error {"Failed to read NRO/NSO magic"};
+        }
+        fseek(fin, 0, SEEK_SET);
+        if (memcmp(ident + 0x10, "NRO0", 4) == 0) {
+            return load_nro_file(fin);
+        }
+        if (memcmp(ident, "NSO0", 4) == 0) {
+            return load_nso_file(fin);
+        }
+        fclose(fin);
+        throw std::runtime_error {"Not an NRO or NSO file"};
+    }
+
+    static NXOProgram load_nso_file(FILE *fin) {
+        NXOProgram prg;
+        NSOHeader header;
+        prg.is_nro = false;
+        if(!fread(&header, sizeof(header), 1, fin)) {
+            fclose(fin);
+            throw std::runtime_error {"Failed to read NSO header"};
+        }
+        prg.text_seg = {header.text.addr, header.text.size};
+        prg.ro_seg   = {header.ro  .addr, header.ro  .size};
+        prg.data_seg = {header.data.addr, header.data.size};
+        prg.bss_size = header.bss_size;
+        prg.api_info = header.api_info;
+        prg.dynstr = header.dynstr;
+        prg.dynsym = header.dynsym;
+
+        prg.text.resize(header.text.size);
+        prg.ro.resize(header.ro.size);
+        prg.data.resize(header.data.size);
+
+        std::vector<uint8_t> filedata;
+
+        filedata.resize(header.text_file_size);
+        fseek(fin, header.text.offset, SEEK_SET);
+        if(!fread(filedata.data(), filedata.size(), 1, fin)) {
+            fclose(fin);
+            throw std::runtime_error {"Failed to read NSO text segment"};
+        }
+        if (header.flags & 1) {
+            LZ4_decompress_safe((const char*) filedata.data(), (char*) prg.text.data(), filedata.size(), prg.text.size());
+        } else {
+            prg.text = filedata;
+        }
+
+        filedata.resize(header.ro_file_size);
+        fseek(fin, header.ro.offset, SEEK_SET);
+        if(!fread(filedata.data(), filedata.size(), 1, fin)) {
+            fclose(fin);
+            throw std::runtime_error {"Failed to read NSO ro segment"};
+        }
+        if (header.flags & 2) {
+            LZ4_decompress_safe((const char*) filedata.data(), (char*) prg.ro.data(), filedata.size(), prg.ro.size());
+        } else {
+            prg.ro = filedata;
+        }
+
+        filedata.resize(header.data_file_size);
+        fseek(fin, header.data.offset, SEEK_SET);
+        if(!fread(filedata.data(), filedata.size(), 1, fin)) {
+            fclose(fin);
+            throw std::runtime_error {"Failed to read NSO data segment"};
+        }
+        if (header.flags & 4) {
+            LZ4_decompress_safe((const char*) filedata.data(), (char*) prg.data.data(), filedata.size(), prg.data.size());
+        } else {
+            prg.data = filedata;
+        }
+
+
+        fclose(fin);
+
+        return prg;
+    }
+
+    static NXOProgram load_nro_file(FILE *fin) {
+        NXOProgram prg;
+        NROHeader header;
+        prg.is_nro = true;
+        if(!fread(&header, sizeof(header), 1, fin)) {
             fclose(fin);
             throw std::runtime_error {"Failed to read NRO header"};
         }
-        if (memcmp(prg.header.magic, "NRO0", 4) != 0) {
-            fclose(fin);
-            throw std::runtime_error {"Not an NRO file"};
-        }
-        prg.text.resize(prg.header.text.size);
-        prg.ro.resize(prg.header.ro.size);
-        prg.data.resize(prg.header.data.size);
+        prg.text_seg = header.text;
+        prg.ro_seg = header.ro;
+        prg.data_seg = header.data;
+        prg.bss_size = header.bss_size;
+        prg.api_info = header.api_info;
+        prg.dynstr = header.dynstr;
+        prg.dynsym = header.dynsym;
+
+        prg.text.resize(header.text.size);
+        prg.ro.resize(header.ro.size);
+        prg.data.resize(header.data.size);
         fseek(fin, 0, SEEK_SET);
         if (
             !fread(prg.text.data(), prg.text.size(), 1, fin) ||
@@ -168,19 +294,21 @@ struct NROProgram {
         return prg;
     }
     MODHeader mod_info() {
-        auto ret = read_data<MODHeader>(header.mod0offset);
+        auto modheader = read_data<ModuleHeader>(0);
+        auto off = modheader.mod0offset;
+        auto ret = read_data<MODHeader>(off);
         if (memcmp(ret.magic, "MOD0", 4) != 0) {
             throw std::runtime_error {"Invalid MOD0"};
         }
-        ret.dyn += header.mod0offset;
-        ret.bss_start += header.mod0offset;
-        ret.bss_end += header.mod0offset;
-        ret.eh_frame_hdr_start += header.mod0offset;
-        ret.eh_frame_hdr_end += header.mod0offset;
-        ret.runtime_mod += header.mod0offset;
+        ret.dyn += off;
+        ret.bss_start += off;
+        ret.bss_end += off;
+        ret.eh_frame_hdr_start += off;
+        ret.eh_frame_hdr_end += off;
+        ret.runtime_mod += off;
         return ret;
     }
-    NROSegment dynamic_seg() {
+    NXOSegment dynamic_seg() {
         // Start is stored in MOD0 header, but not end
         auto dyn = mod_info().dyn;
         if (!dyn) throw std::runtime_error {"No .dynamic section"};
@@ -208,57 +336,60 @@ struct NROProgram {
         uint32_t dynstr_idx = 0;
         uint32_t dynsym_idx = 0;
         uint32_t got_idx = 0;
-        uint32_t bss_end = header.data.addr + header.data.size;
+        uint32_t bss_end = data_seg.addr + data_seg.size + bss_size;
         ret.push_back({
             "",0,0,0,0,0,0
         });
         ret.push_back({
-            ".rocrt_nro.init",
+            is_nro ? ".rocrt_nro.init" : ".rocrt.init",
             SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
-            header.text.addr, 8,
+            text_seg.addr, 0x08,
             0, 0
         });
-        ret.push_back({
-            ".nro_header",
-            SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
-            header.text.addr + 0x08, 0x78,
-            0, 0
-        });
-        if (header.mod0offset) {
+        if (is_nro) {
             ret.push_back({
-                ".rocrt_nro.info",
-                SHT_PROGBITS, SHF_ALLOC,
-                header.mod0offset, sizeof(MODHeader),
+                ".nro_header",
+                SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR,
+                text_seg.addr + 0x08, 0x78,
                 0, 0
             });
         }
-        if (header.api_info.size) {
+        auto modheader = read_data<ModuleHeader>(0);
+        if (modheader.mod0offset) {
+            ret.push_back({
+                is_nro ? ".rocrt_nro.info" : ".rocrt.info",
+                SHT_PROGBITS, SHF_ALLOC,
+                modheader.mod0offset, sizeof(MODHeader),
+                0, 0
+            });
+        }
+        if (api_info.size) {
             ret.push_back({
                 ".api_info",
                 SHT_PROGBITS, SHF_ALLOC,
-                header.api_info.addr + header.ro.addr, header.api_info.size,
+                api_info.addr + ro_seg.addr, api_info.size,
                 0, 0
             });
         }
-        if (header.dynstr.size) {
+        if (dynstr.size) {
             dynstr_idx = ret.size();
             ret.push_back({
                 ".dynstr",
                 SHT_STRTAB, SHF_ALLOC,
-                header.dynstr.addr + header.ro.addr, header.dynstr.size,
+                dynstr.addr + ro_seg.addr, dynstr.size,
                 0, 0
             });
         }
-        if (header.dynsym.size) {
+        if (dynsym.size) {
             dynsym_idx = ret.size();
             ret.push_back({
                 ".dynsym",
                 SHT_DYNSYM, SHF_ALLOC,
-                header.dynsym.addr + header.ro.addr, header.dynsym.size,
+                dynsym.addr + ro_seg.addr, dynsym.size,
                 dynstr_idx, 0x01
             });
         }
-        if (header.mod0offset) {
+        if (modheader.mod0offset) {
             auto mod = mod_info();
             bss_end = mod.bss_end;
             auto dyn_seg = dynamic_seg();
@@ -352,7 +483,7 @@ struct NROProgram {
             }
             if (dyn[DT_GNU_HASH]) {
                 auto hheader = read_data<GNUHashHeader>((uint32_t)dyn[DT_GNU_HASH]);
-                uint32_t symcount = header.dynsym.size / 0x18;
+                uint32_t symcount = dynsym.size / 0x18;
                 ret.push_back({
                     ".gnu.hash",
                     SHT_GNU_HASH, SHF_ALLOC,
@@ -395,12 +526,12 @@ struct NROProgram {
         uint32_t segment_counter = 0;
         for(int seg = 0; seg < 3; seg++) {
             segment_counter = 0;
-            NROSegment pseg;
+            NXOSegment pseg;
             std::string segname;
             switch(seg) {
-                case 0: pseg = header.text; segname = ".text"; break;
-                case 1: pseg = header.ro; segname = ".rodata"; break;
-                case 2: pseg = header.data; pseg.size = bss_end - header.data.addr; segname = ".data"; break;
+                case 0: pseg = text_seg; segname = ".text"; break;
+                case 1: pseg = ro_seg; segname = ".rodata"; break;
+                case 2: pseg = data_seg; pseg.size = bss_end - data_seg.addr; segname = ".data"; break;
             }
             uint32_t last_filled = pseg.addr;
             uint32_t flags = seg == 0 ? SHF_ALLOC | SHF_EXECINSTR : seg == 1 ? SHF_ALLOC : SHF_ALLOC | SHF_WRITE;

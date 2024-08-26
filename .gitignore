@@ -1,4 +1,7 @@
-a.out
-a.out.dSYM
+nxo2elf
+*.dSYM
 *.nrs
+*.nss
+*.nro
+*.nso
 .DS_Store
